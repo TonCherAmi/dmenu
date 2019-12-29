@@ -8,6 +8,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
@@ -35,6 +38,10 @@ struct item {
 };
 
 static char text[BUFSIZ] = "";
+static char btext[BUFSIZ] = "";
+static FILE *histfile = NULL;
+static int ihist = 0;
+static int histlen = 0;
 static char *embed;
 static int bh, mw, mh;
 static int inputw = 0, promptw;
@@ -43,6 +50,7 @@ static size_t cursor;
 static struct item *items = NULL;
 static struct item *matches, *matchend;
 static struct item *prev, *curr, *next, *sel;
+static struct item *histitems = NULL;
 static int mon = -1, screen;
 
 static Atom clip, utf8;
@@ -53,10 +61,44 @@ static XIC xic;
 static Drw *drw;
 static Clr *scheme[SchemeLast];
 
+static struct stat st = { 0 };
+
 #include "config.h"
 
 static int (*fstrncmp)(const char *, const char *, size_t) = strncmp;
 static char *(*fstrstr)(const char *, const char *) = strstr;
+
+static void
+prephist(void)
+{
+  size_t len;
+  int exists;
+  char *histpath = NULL;
+
+  if (stat(histdir, &st) == -1) {
+    mkdir(histdir, 0755);
+  }
+
+  len = strlen(histdir) + strlen(histid) + 1 + 1; /* '\0' + '/' */
+
+  histpath = malloc(len);
+
+  snprintf(histpath, len, "%s/%s", histdir, histid);
+
+  exists = stat(histpath, &st) != -1;
+
+  histfile = fopen(histpath, exists ? "r+" : "w+");
+
+  free(histpath);
+}
+
+static void
+writehist(const char *str)
+{
+  histfile = freopen(NULL, "a", histfile);
+
+  fprintf(histfile, "%s\n", str);
+}
 
 static void
 appenditem(struct item *item, struct item **list, struct item **last)
@@ -100,6 +142,8 @@ cleanup(void)
 	drw_free(drw);
 	XSync(dpy, False);
 	XCloseDisplay(dpy);
+
+	fclose(histfile);
 }
 
 static char *
@@ -222,45 +266,67 @@ match(void)
 	struct item *item, *lprefix, *lsubstr, *prefixend, *substrend;
 
 	strcpy(buf, text);
+
 	/* separate input text into tokens to be matched individually */
-	for (s = strtok(buf, " "); s; tokv[tokc - 1] = s, s = strtok(NULL, " "))
-		if (++tokc > tokn && !(tokv = realloc(tokv, ++tokn * sizeof *tokv)))
+	for (s = strtok(buf, " "); s; tokv[tokc - 1] = s, s = strtok(NULL, " ")) {
+		if (++tokc > tokn && !(tokv = realloc(tokv, ++tokn * sizeof *tokv))) {
 			die("cannot realloc %u bytes:", tokn * sizeof *tokv);
+    }
+  }
+
 	len = tokc ? strlen(tokv[0]) : 0;
 
 	matches = lprefix = lsubstr = matchend = prefixend = substrend = NULL;
+
 	textsize = strlen(text) + 1;
+
 	for (item = items; item && item->text; item++) {
-		for (i = 0; i < tokc; i++)
-			if (!fstrstr(item->text, tokv[i]))
+		for (i = 0; i < tokc; i++) {
+			if (!fstrstr(item->text, tokv[i])) {
 				break;
-		if (i != tokc) /* not all tokens match */
+      }
+    }
+
+		if (i != tokc) { /* not all tokens match */
 			continue;
+    }
+
 		/* exact matches go first, then prefixes, then substrings */
-		if (!tokc || !fstrncmp(text, item->text, textsize))
+		if (!tokc || !fstrncmp(text, item->text, textsize)) {
 			appenditem(item, &matches, &matchend);
-		else if (!fstrncmp(tokv[0], item->text, len))
+    } else if (!fstrncmp(tokv[0], item->text, len)) {
 			appenditem(item, &lprefix, &prefixend);
-		else
+    } else {
 			appenditem(item, &lsubstr, &substrend);
+    }
 	}
+
 	if (lprefix) {
 		if (matches) {
 			matchend->right = lprefix;
+
 			lprefix->left = matchend;
-		} else
+		} else {
 			matches = lprefix;
+    }
+
 		matchend = prefixend;
 	}
+
 	if (lsubstr) {
 		if (matches) {
 			matchend->right = lsubstr;
+
 			lsubstr->left = matchend;
-		} else
+		} else {
 			matches = lsubstr;
+    }
+
 		matchend = substrend;
 	}
+
 	curr = sel = matches;
+
 	calcoffsets();
 }
 
@@ -275,6 +341,17 @@ insert(const char *str, ssize_t n)
 		memcpy(&text[cursor], str, n);
 	cursor += n;
 	match();
+}
+
+static void
+overwrite(const char *str) {
+  strncpy(text, str, sizeof text - 1);
+
+  text[sizeof text - 1] = '\0';
+
+  cursor = strlen(text);
+
+  match();
 }
 
 static size_t
@@ -305,12 +382,39 @@ movewordedge(int dir)
 }
 
 static void
+uphist() {
+  if (ihist <= 0) {
+    return;
+  }
+
+  if (ihist == histlen) {
+    strncpy(btext, text, sizeof text - 1);
+  }
+
+  overwrite(histitems[--ihist].text);
+}
+
+static void
+dnhist() {
+  if (ihist == histlen) {
+    return;
+  }
+
+  if (ihist++ == histlen -1) {
+    overwrite(btext);
+  } else {
+    overwrite(histitems[ihist].text);
+  }
+}
+
+static void
 keypress(XKeyEvent *ev)
 {
 	char buf[32];
 	int len;
 	KeySym ksym;
 	Status status;
+	char *res;
 
 	len = XmbLookupString(xic, ev, buf, sizeof buf, &ksym, &status);
 	switch (status) {
@@ -324,7 +428,7 @@ keypress(XKeyEvent *ev)
 	}
 
 	if (ev->state & ControlMask) {
-		switch(ksym) {
+    switch(ksym) {
 		case XK_a: ksym = XK_Home;      break;
 		case XK_b: ksym = XK_Left;      break;
 		case XK_c: ksym = XK_Escape;    break;
@@ -382,6 +486,12 @@ keypress(XKeyEvent *ev)
 		case XK_f:
 			movewordedge(+1);
 			goto draw;
+		case XK_p:
+		  uphist();
+      goto draw;
+		case XK_n:
+		  dnhist();
+      goto draw;
 		case XK_g: ksym = XK_Home;  break;
 		case XK_G: ksym = XK_End;   break;
 		case XK_h: ksym = XK_Up;    break;
@@ -464,13 +574,19 @@ insert:
 		break;
 	case XK_Return:
 	case XK_KP_Enter:
-		puts((sel && !(ev->state & ShiftMask)) ? sel->text : text);
+	  res = (sel && !(ev->state & ShiftMask)) ? sel->text : text;
+
+    writehist(res);
+		puts(res);
+
 		if (!(ev->state & ControlMask)) {
 			cleanup();
 			exit(0);
 		}
+
 		if (sel)
 			sel->out = 1;
+
 		break;
 	case XK_Right:
 		if (text[cursor] != '\0') {
@@ -489,10 +605,7 @@ insert:
 	case XK_Tab:
 		if (!sel)
 			return;
-		strncpy(text, sel->text, sizeof text - 1);
-		text[sizeof text - 1] = '\0';
-		cursor = strlen(text);
-		match();
+		overwrite(sel->text);
 		break;
 	}
 
@@ -504,47 +617,76 @@ static void
 paste(void)
 {
 	char *p, *q;
-	int di;
+	int di, e;
 	unsigned long dl;
 	Atom da;
 
+  e = XGetWindowProperty(
+    dpy,
+    win,
+    utf8,
+    0,
+    (sizeof text / 4) + 1,
+    False,
+    utf8,
+    &da,
+    &di,
+    &dl,
+    &dl,
+    (unsigned char **) &p
+  );
+
 	/* we have been given the current selection, now insert it into input */
-	if (XGetWindowProperty(dpy, win, utf8, 0, (sizeof text / 4) + 1, False,
-	                   utf8, &da, &di, &dl, &dl, (unsigned char **)&p)
-	    == Success && p) {
-		insert(p, (q = strchr(p, '\n')) ? q - p : (ssize_t)strlen(p));
+	if (e == Success && p) {
+		insert(p, (q = strchr(p, '\n')) ? q - p : (ssize_t) strlen(p));
+
 		XFree(p);
 	}
 	drawmenu();
 }
 
 static void
-readstdin(void)
+readitems(FILE *src, struct item **dst, int *n)
 {
 	char buf[sizeof text], *p;
 	size_t i, imax = 0, size = 0;
 	unsigned int tmpmax = 0;
 
 	/* read each line from stdin and add it to the item list */
-	for (i = 0; fgets(buf, sizeof buf, stdin); i++) {
-		if (i + 1 >= size / sizeof *items)
-			if (!(items = realloc(items, (size += BUFSIZ))))
+	for (i = 0; fgets(buf, sizeof buf, src); i++) {
+		if (i + 1 >= size / sizeof **dst) {
+			if (!(*dst = realloc(*dst, (size += BUFSIZ)))) {
 				die("cannot realloc %u bytes:", size);
-		if ((p = strchr(buf, '\n')))
+      }
+    }
+
+		if ((p = strchr(buf, '\n'))) {
 			*p = '\0';
-		if (!(items[i].text = strdup(buf)))
+    }
+
+		if (!((*dst)[i].text = strdup(buf))) {
 			die("cannot strdup %u bytes:", strlen(buf) + 1);
-		items[i].out = 0;
+    }
+
+		(*dst)[i].out = 0;
+
 		drw_font_getexts(drw->fonts, buf, strlen(buf), &tmpmax, NULL);
+
 		if (tmpmax > inputw) {
 			inputw = tmpmax;
 			imax = i;
 		}
 	}
-	if (items)
-		items[i].text = NULL;
-	inputw = items ? TEXTW(items[imax].text) : 0;
-	lines = MIN(lines, i);
+
+	if (*dst) {
+		(*dst)[i].text = NULL;
+  }
+
+  inputw = *dst ? TEXTW((*dst)[imax].text) : 0;
+
+  if (n) {
+    *n = i;
+  }
 }
 
 static void
@@ -553,33 +695,47 @@ run(void)
 	XEvent ev;
 
 	while (!XNextEvent(dpy, &ev)) {
-		if (XFilterEvent(&ev, win))
+		if (XFilterEvent(&ev, win)) {
 			continue;
+    }
+
 		switch(ev.type) {
 		case DestroyNotify:
-			if (ev.xdestroywindow.window != win)
+			if (ev.xdestroywindow.window != win) {
 				break;
+      }
+
 			cleanup();
+
 			exit(1);
 		case Expose:
-			if (ev.xexpose.count == 0)
+			if (ev.xexpose.count == 0) {
 				drw_map(drw, win, 0, 0, mw, mh);
+      }
+
 			break;
 		case FocusIn:
 			/* regrab focus from parent window */
-			if (ev.xfocus.window != win)
+			if (ev.xfocus.window != win) {
 				grabfocus();
+      }
+
 			break;
 		case KeyPress:
 			keypress(&ev.xkey);
+
 			break;
 		case SelectionNotify:
-			if (ev.xselection.property == utf8)
+			if (ev.xselection.property == utf8) {
 				paste();
+      }
+
 			break;
 		case VisibilityNotify:
-			if (ev.xvisibility.state != VisibilityUnobscured)
+			if (ev.xvisibility.state != VisibilityUnobscured) {
 				XRaiseWindow(dpy, win);
+      }
+
 			break;
 		}
 	}
@@ -600,9 +756,11 @@ setup(void)
 	Window pw;
 	int a, di, n, area = 0;
 #endif
+
 	/* init appearance */
-	for (j = 0; j < SchemeLast; j++)
+	for (j = 0; j < SchemeLast; j++) {
 		scheme[j] = drw_scm_create(drw, colors[j], 2);
+  }
 
 	clip = XInternAtom(dpy, "CLIPBOARD",   False);
 	utf8 = XInternAtom(dpy, "UTF8_STRING", False);
@@ -611,86 +769,139 @@ setup(void)
 	bh = drw->fonts->h + 2;
 	lines = MAX(lines, 0);
 	mh = (lines + 1) * bh;
+
 #ifdef XINERAMA
 	i = 0;
+
 	if (parentwin == root && (info = XineramaQueryScreens(dpy, &n))) {
 		XGetInputFocus(dpy, &w, &di);
-		if (mon >= 0 && mon < n)
+
+		if (mon >= 0 && mon < n) {
 			i = mon;
-		else if (w != root && w != PointerRoot && w != None) {
+    } else if (w != root && w != PointerRoot && w != None) {
 			/* find top-level window containing current input focus */
 			do {
-				if (XQueryTree(dpy, (pw = w), &dw, &w, &dws, &du) && dws)
+				if (XQueryTree(dpy, (pw = w), &dw, &w, &dws, &du) && dws) {
 					XFree(dws);
+        }
 			} while (w != root && w != pw);
+
 			/* find xinerama screen with which the window intersects most */
-			if (XGetWindowAttributes(dpy, pw, &wa))
-				for (j = 0; j < n; j++)
+			if (XGetWindowAttributes(dpy, pw, &wa)) {
+				for (j = 0; j < n; j++) {
 					if ((a = INTERSECT(wa.x, wa.y, wa.width, wa.height, info[j])) > area) {
 						area = a;
 						i = j;
 					}
+        }
+      }
 		}
+
 		/* no focused window is on screen, so use pointer location instead */
-		if (mon < 0 && !area && XQueryPointer(dpy, root, &dw, &dw, &x, &y, &di, &di, &du))
-			for (i = 0; i < n; i++)
-				if (INTERSECT(x, y, 1, 1, info[i]))
+		if (mon < 0 && !area && XQueryPointer(dpy, root, &dw, &dw, &x, &y, &di, &di, &du)) {
+      for (i = 0; i < n; i++) {
+				if (INTERSECT(x, y, 1, 1, info[i])) {
 					break;
+        }
+      }
+    }
 
 		x = info[i].x_org;
 		y = info[i].y_org + (topbar ? 0 : info[i].height - mh);
+
 		mw = info[i].width;
+
 		XFree(info);
 	} else
 #endif
 	{
-		if (!XGetWindowAttributes(dpy, parentwin, &wa))
-			die("could not get embedding window attributes: 0x%lx",
-			    parentwin);
+		if (!XGetWindowAttributes(dpy, parentwin, &wa)) {
+			die(
+			  "could not get embedding window attributes: 0x%lx",
+        parentwin
+      );
+    }
+
 		x = 0;
 		y = topbar ? 0 : wa.height - mh;
+
 		mw = wa.width;
 	}
-	promptw = (prompt && *prompt) ? TEXTW(prompt) - lrpad / 4 : 0;
-	inputw = MIN(inputw, mw/3);
+
+	promptw = (prompt && *prompt)
+	  ? TEXTW(prompt) - lrpad / 4
+	  : 0;
+
+	inputw = MIN(inputw, mw / 3);
+
 	match();
 
 	/* create menu window */
 	swa.override_redirect = True;
 	swa.background_pixel = scheme[SchemeNorm][ColBg].pixel;
 	swa.event_mask = ExposureMask | KeyPressMask | VisibilityChangeMask;
-	win = XCreateWindow(dpy, parentwin, x, y, mw, mh, 0,
-	                    CopyFromParent, CopyFromParent, CopyFromParent,
-	                    CWOverrideRedirect | CWBackPixel | CWEventMask, &swa);
+
+	win = XCreateWindow(
+    dpy,
+    parentwin,
+    x, y,
+    mw, mh,
+    0,
+    CopyFromParent,
+    CopyFromParent,
+    CopyFromParent,
+    CWOverrideRedirect | CWBackPixel | CWEventMask,
+    &swa
+  );
+
 	XSetClassHint(dpy, win, &ch);
 
-
 	/* input methods */
-	if ((xim = XOpenIM(dpy, NULL, NULL, NULL)) == NULL)
+	if ((xim = XOpenIM(dpy, NULL, NULL, NULL)) == NULL) {
 		die("XOpenIM failed: could not open input device");
+  }
 
-	xic = XCreateIC(xim, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
-	                XNClientWindow, win, XNFocusWindow, win, NULL);
+	xic = XCreateIC(
+    xim,
+    XNInputStyle,
+    XIMPreeditNothing | XIMStatusNothing,
+	  XNClientWindow,
+	  win,
+	  XNFocusWindow,
+	  win,
+	  NULL
+  );
 
 	XMapRaised(dpy, win);
+
 	if (embed) {
 		XSelectInput(dpy, parentwin, FocusChangeMask | SubstructureNotifyMask);
+
 		if (XQueryTree(dpy, parentwin, &dw, &w, &dws, &du) && dws) {
-			for (i = 0; i < du && dws[i] != win; ++i)
+			for (i = 0; i < du && dws[i] != win; ++i) {
 				XSelectInput(dpy, dws[i], FocusChangeMask);
+      }
+
 			XFree(dws);
 		}
+
 		grabfocus();
 	}
+
 	drw_resize(drw, mw, mh);
+
 	drawmenu();
 }
 
 static void
 usage(void)
 {
-	fputs("usage: dmenu [-bfiv] [-l lines] [-p prompt] [-fn font] [-m monitor]\n"
-	      "             [-nb color] [-nf color] [-sb color] [-sf color] [-w windowid]\n", stderr);
+	fputs(
+    "usage: dmenu [-bfiv] [-l lines] [-p prompt] [-fn font] [-m monitor]\n"
+    "             [-nb color] [-nf color] [-sb color] [-sf color] [-w windowid]\n",
+    stderr
+  );
+
 	exit(1);
 }
 
@@ -698,7 +909,8 @@ int
 main(int argc, char *argv[])
 {
 	XWindowAttributes wa;
-	int i, fast = 0;
+
+	int i, fast = 0, n = 0;
 
 	for (i = 1; i < argc; i++)
 		/* these options take no arguments */
@@ -733,6 +945,8 @@ main(int argc, char *argv[])
 			colors[SchemeSel][ColFg] = argv[++i];
 		else if (!strcmp(argv[i], "-w"))   /* embedding window id */
 			embed = argv[++i];
+		else if (!strcmp(argv[i], "-hi"))   /* history id */
+			histid = argv[++i];
 		else
 			usage();
 
@@ -753,18 +967,33 @@ main(int argc, char *argv[])
 	lrpad = drw->fonts->h;
 
 #ifdef __OpenBSD__
-	if (pledge("stdio rpath", NULL) == -1)
+	if (pledge("stdio rpath", NULL) == -1) {
 		die("pledge");
+  }
 #endif
+
+  prephist();
 
 	if (fast && !isatty(0)) {
 		grabkeyboard();
-		readstdin();
+
+		readitems(histfile, &histitems, &histlen);
+		readitems(stdin, &items, &n);
+
+		ihist = histlen;
+		lines = MIN(lines, n);
 	} else {
-		readstdin();
+		readitems(histfile, &histitems, &histlen);
+		readitems(stdin, &items, &n);
+
+		ihist = histlen;
+		lines = MIN(lines, n);
+
 		grabkeyboard();
 	}
+
 	setup();
+
 	run();
 
 	return 1; /* unreachable */

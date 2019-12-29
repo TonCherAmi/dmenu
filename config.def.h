@@ -21,3 +21,13 @@ static unsigned int lines      = 0;
  * for example: " /?\"&[]"
  */
 static const char worddelimiters[] = " ";
+
+/*
+ * History directory path
+ */
+static const char histdir[] = "/tmp/.dmenu_history";
+
+/*
+ * Default history id
+ */
+static const char *histid = "default";
