@@ -1024,7 +1024,7 @@ usage(void)
 {
   fputs(
     "usage: dmenu [-bfiv] [-l lines] [-p prompt] [-fn font] [-m monitor]\n"
-    "             [-nb color] [-nf color] [-sb color] [-sf color] [-w windowid]\n",
+    "             [-nb color] [-nf color] [-sb color] [-sf color] [-w windowid] [-hi histid]\n",
     stderr
   );
 
