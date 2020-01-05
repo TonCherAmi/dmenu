@@ -95,6 +95,10 @@ prephist(void)
 static void
 writehist(const char *str)
 {
+  if (histitems && !strncmp(str, histitems[histlen - 1].text, sizeof text - 1)) {
+    return;
+  }
+
   histfile = freopen(NULL, "a", histfile);
 
   fprintf(histfile, "%s\n", str);
